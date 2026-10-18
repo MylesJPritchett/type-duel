@@ -79,6 +79,16 @@ pub async fn game_page(Path(code): Path<String>) -> Html<String> {
   #defense-queue .queue-word.current {{
     background: #3498db; color: white; font-weight: bold;
   }}
+  #game-over-area {{ display: none; margin-top: 20px; }}
+  #game-over-area.visible {{ display: block; }}
+  #game-over-result {{ font-size: 2em; font-weight: bold; margin: 10px 0; }}
+  #game-over-result.win {{ color: #2ecc71; }}
+  #game-over-result.lose {{ color: #e74c3c; }}
+  .stats-table {{ margin: 10px auto; border-collapse: collapse; min-width: 400px; }}
+  .stats-table th, .stats-table td {{ border: 1px solid #ccc; padding: 8px 16px; text-align: center; }}
+  .stats-table th {{ background: #f0f0f0; }}
+  #play-again-btn {{ font-size: 1.3em; padding: 10px 30px; cursor: pointer; margin-top: 15px; }}
+  #play-again-btn:disabled {{ opacity: 0.5; cursor: not-allowed; }}
 </style>
 </head>
 <body>
@@ -99,6 +109,12 @@ pub async fn game_page(Path(code): Path<String>) -> Html<String> {
   <div id="defense-word"></div>
   <div id="defense-feedback"></div>
 </div>
+<div id="game-over-area">
+  <div id="game-over-result"></div>
+  <div id="game-over-stats"></div>
+  <div id="game-over-duration"></div>
+  <button id="play-again-btn">Play Again</button>
+</div>
 <script>
   const code = "{code}";
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -117,7 +133,13 @@ pub async fn game_page(Path(code): Path<String>) -> Html<String> {
   const defenseYourQueueEl = document.getElementById('defense-your-queue');
   const defenseQueueEl = document.getElementById('defense-queue');
   const defenseWordEl = document.getElementById('defense-word');
+  const gameOverArea = document.getElementById('game-over-area');
+  const gameOverResult = document.getElementById('game-over-result');
+  const gameOverStats = document.getElementById('game-over-stats');
+  const gameOverDuration = document.getElementById('game-over-duration');
+  const playAgainBtn = document.getElementById('play-again-btn');
   let feedbackTimeout = null;
+  let myPlayerNum = 0;
 
   let gameMode = 'attack'; // 'attack' or 'defense'
   let defenseQueue = [];
@@ -133,6 +155,12 @@ pub async fn game_page(Path(code): Path<String>) -> Html<String> {
     ws.send(JSON.stringify({{"type":"ready"}}));
     readyBtn.disabled = true;
     readyBtn.textContent = 'Waiting...';
+  }};
+
+  playAgainBtn.onclick = () => {{
+    ws.send(JSON.stringify({{"type":"play_again"}}));
+    playAgainBtn.disabled = true;
+    playAgainBtn.textContent = 'Waiting for opponent...';
   }};
 
   function switchToDefense() {{
@@ -207,12 +235,10 @@ pub async fn game_page(Path(code): Path<String>) -> Html<String> {
   ws.onmessage = (event) => {{
     const msg = JSON.parse(event.data);
     if (msg.type === 'room_joined') {{
+      myPlayerNum = msg.player;
       statusEl.textContent = `Joined as Player ${{msg.player}}. Waiting for opponent...`;
     }} else if (msg.type === 'player_joined') {{
       statusEl.textContent = 'Opponent joined!';
-    }} else if (msg.type === 'waiting_for_ready') {{
-      statusEl.textContent = 'Both players connected. Click Ready!';
-      readyBtn.style.display = 'inline-block';
     }} else if (msg.type === 'countdown') {{
       overlay.classList.add('visible');
       countdownText.textContent = msg.value === 0 ? 'GO!' : msg.value;
@@ -249,11 +275,49 @@ pub async fn game_page(Path(code): Path<String>) -> Html<String> {
       updateQueueDisplays(msg.your_queue, msg.opponent_queue);
     }} else if (msg.type === 'game_over') {{
       gameActive = false;
-      statusEl.textContent = msg.winner
-        ? `Game Over! Player ${{msg.winner}} wins (${{msg.reason}})`
-        : `Game Over! (${{msg.reason}})`;
       attackArea.classList.remove('visible');
       defenseArea.classList.remove('visible');
+      gameOverArea.classList.add('visible');
+      readyBtn.style.display = 'none';
+
+      if (msg.winner === myPlayerNum) {{
+        gameOverResult.textContent = 'You Win!';
+        gameOverResult.className = 'win';
+      }} else {{
+        gameOverResult.textContent = 'You Lose!';
+        gameOverResult.className = 'lose';
+      }}
+
+      statusEl.textContent = `Game Over (${{msg.reason}})`;
+
+      if (msg.stats) {{
+        const s = msg.stats;
+        gameOverStats.innerHTML = `
+          <table class="stats-table">
+            <tr><th></th><th>Player 1</th><th>Player 2</th></tr>
+            <tr><td>Words Sent</td><td>${{s.player1.words_sent}}</td><td>${{s.player2.words_sent}}</td></tr>
+            <tr><td>Words Completed</td><td>${{s.player1.words_completed}}</td><td>${{s.player2.words_completed}}</td></tr>
+            <tr><td>Longest Word</td><td>${{s.player1.longest_word_sent || '-'}}</td><td>${{s.player2.longest_word_sent || '-'}}</td></tr>
+            <tr><td>Avg WPM</td><td>${{s.player1.avg_wpm}}</td><td>${{s.player2.avg_wpm}}</td></tr>
+          </table>`;
+      }}
+
+      if (msg.duration_secs !== undefined) {{
+        gameOverDuration.textContent = `Game duration: ${{Math.round(msg.duration_secs)}}s`;
+      }}
+
+      playAgainBtn.disabled = false;
+      playAgainBtn.textContent = 'Play Again';
+    }} else if (msg.type === 'waiting_for_ready') {{
+      // Handle both initial and rematch waiting_for_ready
+      gameOverArea.classList.remove('visible');
+      statusEl.textContent = 'Both players connected. Click Ready!';
+      readyBtn.style.display = 'inline-block';
+      readyBtn.disabled = false;
+      readyBtn.textContent = 'Ready';
+      defenseQueue = [];
+      currentDefenseWord = '';
+      typedChars = '';
     }}
   }};
 
@@ -428,13 +492,16 @@ async fn handle_socket(mut socket: WebSocket, code: String, state: AppState) {
                     };
 
                     if still_playing {
-                        if let Some(tx) = other_tx {
-                            let game_over_msg = serde_json::json!({
-                                "type": "game_over",
-                                "reason": "opponent_disconnected",
-                                "winner": other_player
-                            });
-                            let _ = tx.send(game_over_msg.to_string());
+                        let game_over_msg = {
+                            let rooms = state_clone.rooms.lock().unwrap();
+                            rooms.get(&code_clone).map(|room| {
+                                room.get_game_stats(other_player, "opponent_disconnected")
+                            })
+                        };
+                        if let Some(msg) = game_over_msg {
+                            if let Some(tx) = other_tx {
+                                let _ = tx.send(msg.to_string());
+                            }
                         }
                         game::set_room_state(&state_clone, &code_clone, RoomState::GameOver);
                     }
@@ -551,6 +618,13 @@ fn handle_client_message(state: &AppState, code: &str, player_num: u8, text: &st
                                 .to_string(),
                             );
                         }
+
+                        // Check for queue overflow
+                        if let Some(winner) = room.check_overflow(player_num) {
+                            let game_over_msg = room.get_game_stats(winner, "queue_overflow");
+                            room.state = RoomState::GameOver;
+                            room.broadcast(&game_over_msg.to_string());
+                        }
                     }
                     _ => {
                         // Send word_rejected to submitter only
@@ -620,6 +694,21 @@ fn handle_client_message(state: &AppState, code: &str, player_num: u8, text: &st
                 }
             }
         }
+        Some("play_again") => {
+            let mut rooms = state.rooms.lock().unwrap();
+            if let Some(room) = rooms.get_mut(code) {
+                if room.state != RoomState::GameOver {
+                    return;
+                }
+                let both = room.set_play_again(player_num);
+                if both {
+                    room.reset_for_rematch();
+                    room.broadcast(
+                        &serde_json::json!({"type": "waiting_for_ready"}).to_string(),
+                    );
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -648,5 +737,6 @@ async fn run_countdown(
     if let Some(room) = rooms.get_mut(code) {
         room.state = RoomState::Playing;
         room.init_player_states();
+        room.game_started_at = Some(std::time::Instant::now());
     }
 }

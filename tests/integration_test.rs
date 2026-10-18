@@ -666,3 +666,155 @@ async fn test_websocket_room_full() {
     ws1.close(None).await.unwrap();
     ws2.close(None).await.unwrap();
 }
+
+#[tokio::test]
+async fn test_queue_overflow_triggers_game_over() {
+    let base_url = start_server().await;
+    let (mut ws1, mut ws2) = setup_playing_game(&base_url).await;
+
+    // Player 1 sends 10 words to player 2's queue (overflow threshold)
+    let words = [
+        "abacus", "abdomen", "abide", "ablaze", "able",
+        "abnormal", "abrasion", "abrasive", "abstract", "absurd",
+    ];
+
+    for word in &words {
+        send_json(&mut ws1, serde_json::json!({"type": "submit_word", "word": word})).await;
+        let _ = recv_json(&mut ws1).await; // word_sent
+        let _ = recv_json(&mut ws2).await; // word_received
+        let _ = recv_json(&mut ws1).await; // queue_update for p1
+        let _ = recv_json(&mut ws2).await; // queue_update for p2
+    }
+
+    // After the 10th word, both should receive game_over
+    let msg1 = recv_json(&mut ws1).await;
+    assert_eq!(msg1["type"], "game_over");
+    assert_eq!(msg1["reason"], "queue_overflow");
+    assert_eq!(msg1["winner"], 1);
+    assert_eq!(msg1["loser"], 2);
+
+    let msg2 = recv_json(&mut ws2).await;
+    assert_eq!(msg2["type"], "game_over");
+    assert_eq!(msg2["reason"], "queue_overflow");
+    assert_eq!(msg2["winner"], 1);
+
+    ws1.close(None).await.unwrap();
+    ws2.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_game_over_includes_stats() {
+    let base_url = start_server().await;
+    let (mut ws1, mut ws2) = setup_playing_game(&base_url).await;
+
+    // Player 1 sends 10 words
+    let words = [
+        "abacus", "abdomen", "abide", "ablaze", "able",
+        "abnormal", "abrasion", "abrasive", "abstract", "absurd",
+    ];
+
+    for word in &words {
+        send_json(&mut ws1, serde_json::json!({"type": "submit_word", "word": word})).await;
+        let _ = recv_json(&mut ws1).await; // word_sent
+        let _ = recv_json(&mut ws2).await; // word_received
+        let _ = recv_json(&mut ws1).await; // queue_update
+        let _ = recv_json(&mut ws2).await; // queue_update
+    }
+
+    let msg = recv_json(&mut ws1).await;
+    assert_eq!(msg["type"], "game_over");
+
+    // Check stats exist
+    assert!(msg["stats"]["player1"].is_object());
+    assert!(msg["stats"]["player2"].is_object());
+    assert_eq!(msg["stats"]["player1"]["words_sent"], 10);
+    assert_eq!(msg["stats"]["player1"]["words_completed"], 0);
+    assert_eq!(msg["stats"]["player2"]["words_sent"], 0);
+    assert!(msg["duration_secs"].is_number());
+    // Longest word should be "abnormal" or "abrasion" or "abrasive" or "abstract" (8 chars)
+    let longest = msg["stats"]["player1"]["longest_word_sent"].as_str().unwrap();
+    assert!(longest.len() >= 7, "longest word should be tracked");
+
+    // Consume p2's game_over too
+    let _ = recv_json(&mut ws2).await;
+
+    ws1.close(None).await.unwrap();
+    ws2.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_play_again_flow() {
+    let base_url = start_server().await;
+    let (mut ws1, mut ws2) = setup_playing_game(&base_url).await;
+
+    // Trigger game over via overflow
+    let words = [
+        "abacus", "abdomen", "abide", "ablaze", "able",
+        "abnormal", "abrasion", "abrasive", "abstract", "absurd",
+    ];
+
+    for word in &words {
+        send_json(&mut ws1, serde_json::json!({"type": "submit_word", "word": word})).await;
+        let _ = recv_json(&mut ws1).await; // word_sent
+        let _ = recv_json(&mut ws2).await; // word_received
+        let _ = recv_json(&mut ws1).await; // queue_update
+        let _ = recv_json(&mut ws2).await; // queue_update
+    }
+
+    // Consume game_over
+    let _ = recv_json(&mut ws1).await;
+    let _ = recv_json(&mut ws2).await;
+
+    // Only player 1 sends play_again -- nothing should happen yet
+    send_json(&mut ws1, serde_json::json!({"type": "play_again"})).await;
+    let result = tokio::time::timeout(std::time::Duration::from_millis(300), ws1.next()).await;
+    assert!(result.is_err(), "Should not receive message with only one play_again");
+
+    // Player 2 sends play_again -- both should get waiting_for_ready
+    send_json(&mut ws2, serde_json::json!({"type": "play_again"})).await;
+
+    let msg1 = recv_json(&mut ws1).await;
+    assert_eq!(msg1["type"], "waiting_for_ready");
+
+    let msg2 = recv_json(&mut ws2).await;
+    assert_eq!(msg2["type"], "waiting_for_ready");
+
+    ws1.close(None).await.unwrap();
+    ws2.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_game_page_has_game_over_elements() {
+    let base_url = start_server().await;
+    let code = create_room(&base_url).await;
+    let res = reqwest::get(format!("{base_url}/game/{code}"))
+        .await
+        .unwrap();
+    let body = res.text().await.unwrap();
+    assert!(body.contains("game-over-area"), "Game page should have game over area");
+    assert!(body.contains("play-again-btn"), "Game page should have play again button");
+    assert!(body.contains("game-over-stats"), "Game page should have stats area");
+    assert!(body.contains("play_again"), "Game page should send play_again messages");
+}
+
+#[tokio::test]
+async fn test_disconnect_game_over_includes_stats() {
+    let base_url = start_server().await;
+    let (ws1, mut ws2) = setup_playing_game(&base_url).await;
+
+    // Player 1 disconnects
+    drop(ws1);
+
+    // Player 2 should receive game_over with stats after timeout
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(10), recv_json(&mut ws2))
+        .await
+        .expect("timed out waiting for game_over");
+    assert_eq!(msg["type"], "game_over");
+    assert_eq!(msg["reason"], "opponent_disconnected");
+    assert_eq!(msg["winner"], 2);
+    // Stats should be present
+    assert!(msg["stats"].is_object());
+    assert!(msg["stats"]["player1"].is_object());
+    assert!(msg["stats"]["player2"].is_object());
+    assert!(msg["duration_secs"].is_number());
+}

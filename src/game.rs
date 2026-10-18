@@ -1,10 +1,14 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use rand::Rng;
 use tokio::sync::mpsc;
 
 use crate::dictionary;
+
+/// Queue overflow threshold — game ends when a player's defense queue reaches this size
+pub const OVERFLOW_THRESHOLD: usize = 10;
 
 /// Room lifecycle states
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +31,10 @@ pub struct PlayerState {
     pub words_sent: u32,
     /// Counter of words successfully completed (defended)
     pub words_completed: u32,
+    /// Longest word this player successfully sent
+    pub longest_word_sent: Option<String>,
+    /// Total characters typed (sum of lengths of all words sent + completed)
+    pub total_chars_typed: u32,
 }
 
 impl PlayerState {
@@ -36,6 +44,8 @@ impl PlayerState {
             last_sent_word: None,
             words_sent: 0,
             words_completed: 0,
+            longest_word_sent: None,
+            total_chars_typed: 0,
         }
     }
 }
@@ -69,6 +79,12 @@ pub struct Room {
     pub player1_state: Option<PlayerState>,
     /// Player 2 game state (initialized when game starts)
     pub player2_state: Option<PlayerState>,
+    /// Timestamp when the game started playing
+    pub game_started_at: Option<Instant>,
+    /// Whether player 1 wants to play again
+    pub player1_play_again: bool,
+    /// Whether player 2 wants to play again
+    pub player2_play_again: bool,
 }
 
 impl Room {
@@ -82,6 +98,9 @@ impl Room {
             player_txs: Vec::new(),
             player1_state: None,
             player2_state: None,
+            game_started_at: None,
+            player1_play_again: false,
+            player2_play_again: false,
         }
     }
 
@@ -150,6 +169,16 @@ impl Room {
         // Update submitter's state
         submitter.last_sent_word = Some(word.to_string());
         submitter.words_sent += 1;
+        submitter.total_chars_typed += word.len() as u32;
+
+        // Track longest word sent
+        let is_longer = submitter
+            .longest_word_sent
+            .as_ref()
+            .map_or(true, |prev| word.len() > prev.len());
+        if is_longer {
+            submitter.longest_word_sent = Some(word.to_string());
+        }
 
         // Add to opponent's defense queue
         let opponent_state = match player_num {
@@ -205,14 +234,97 @@ impl Room {
             return false;
         }
 
-        state.defense_queue.remove(0);
+        let completed_word = state.defense_queue.remove(0);
         state.words_completed += 1;
+        state.total_chars_typed += completed_word.len() as u32;
         true
     }
 
     /// Check if the room is currently in a playing state
     pub fn is_playing(&self) -> bool {
         self.state == RoomState::Playing
+    }
+
+    /// Check if the opponent's queue has reached the overflow threshold.
+    /// Returns Some(winner_player_num) if overflow detected, None otherwise.
+    pub fn check_overflow(&self, submitter: u8) -> Option<u8> {
+        let opponent = if submitter == 1 { 2 } else { 1 };
+        if self.queue_len(opponent) >= OVERFLOW_THRESHOLD {
+            Some(submitter) // The submitter wins
+        } else {
+            None
+        }
+    }
+
+    /// Compute game stats as a JSON value for the game_over message.
+    pub fn get_game_stats(&self, winner: u8, reason: &str) -> serde_json::Value {
+        let loser = if winner == 1 { 2u8 } else { 1 };
+
+        let duration_secs = self
+            .game_started_at
+            .map(|start| start.elapsed().as_secs_f64())
+            .unwrap_or(0.0);
+
+        let duration_minutes = duration_secs / 60.0;
+
+        let player_stats = |state: &Option<PlayerState>| -> serde_json::Value {
+            match state {
+                Some(s) => {
+                    let avg_wpm = if duration_minutes > 0.0 {
+                        ((s.total_chars_typed as f64 / 5.0) / duration_minutes * 10.0).round()
+                            / 10.0
+                    } else {
+                        0.0
+                    };
+                    serde_json::json!({
+                        "words_sent": s.words_sent,
+                        "words_completed": s.words_completed,
+                        "longest_word_sent": s.longest_word_sent.as_deref().unwrap_or(""),
+                        "avg_wpm": avg_wpm
+                    })
+                }
+                None => serde_json::json!({
+                    "words_sent": 0,
+                    "words_completed": 0,
+                    "longest_word_sent": "",
+                    "avg_wpm": 0.0
+                }),
+            }
+        };
+
+        serde_json::json!({
+            "type": "game_over",
+            "reason": reason,
+            "winner": winner,
+            "loser": loser,
+            "stats": {
+                "player1": player_stats(&self.player1_state),
+                "player2": player_stats(&self.player2_state)
+            },
+            "duration_secs": (duration_secs * 10.0).round() / 10.0
+        })
+    }
+
+    /// Mark a player as wanting to play again. Returns true if both want to play again.
+    pub fn set_play_again(&mut self, player_num: u8) -> bool {
+        match player_num {
+            1 => self.player1_play_again = true,
+            2 => self.player2_play_again = true,
+            _ => {}
+        }
+        self.player1_play_again && self.player2_play_again
+    }
+
+    /// Reset the room for a rematch. Clears player states, ready flags, play_again flags.
+    pub fn reset_for_rematch(&mut self) {
+        self.player1_state = None;
+        self.player2_state = None;
+        self.player1_ready = false;
+        self.player2_ready = false;
+        self.player1_play_again = false;
+        self.player2_play_again = false;
+        self.game_started_at = None;
+        self.state = RoomState::WaitingForReady;
     }
 }
 
@@ -665,5 +777,203 @@ mod tests {
         // Countdown done -> playing
         room.state = RoomState::Playing;
         assert_eq!(room.state, RoomState::Playing);
+    }
+
+    #[test]
+    fn test_overflow_threshold_constant() {
+        assert_eq!(OVERFLOW_THRESHOLD, 10);
+    }
+
+    #[test]
+    fn test_queue_overflow_detection_at_threshold() {
+        let mut room = Room::new("TEST".to_string());
+        room.init_player_states();
+
+        // Use 10 different valid words from the EFF list
+        let words = [
+            "abacus", "abdomen", "abide", "ablaze", "able",
+            "abnormal", "abrasion", "abrasive", "abstract", "absurd",
+        ];
+
+        // Send 9 words — no overflow
+        for i in 0..9 {
+            room.submit_word(1, words[i]);
+            assert_eq!(room.check_overflow(1), None, "Should not overflow at queue size {}", i + 1);
+        }
+
+        // 10th word triggers overflow
+        room.submit_word(1, words[9]);
+        assert_eq!(room.check_overflow(1), Some(1), "Should overflow at queue size 10");
+    }
+
+    #[test]
+    fn test_overflow_detection_player2_overflows() {
+        let mut room = Room::new("TEST".to_string());
+        room.init_player_states();
+
+        let words = [
+            "abacus", "abdomen", "abide", "ablaze", "able",
+            "abnormal", "abrasion", "abrasive", "abstract", "absurd",
+        ];
+
+        // Player 2 sends words to player 1's queue
+        for word in &words {
+            room.submit_word(2, word);
+        }
+
+        // Player 2 is the submitter, player 1's queue overflows
+        assert_eq!(room.check_overflow(2), Some(2));
+    }
+
+    #[test]
+    fn test_longest_word_sent_tracking() {
+        let mut room = Room::new("TEST".to_string());
+        room.init_player_states();
+
+        room.submit_word(1, "able");
+        assert_eq!(
+            room.player1_state.as_ref().unwrap().longest_word_sent,
+            Some("able".to_string())
+        );
+
+        room.submit_word(1, "abdomen");
+        assert_eq!(
+            room.player1_state.as_ref().unwrap().longest_word_sent,
+            Some("abdomen".to_string())
+        );
+
+        // Shorter word shouldn't replace
+        room.submit_word(1, "abide");
+        assert_eq!(
+            room.player1_state.as_ref().unwrap().longest_word_sent,
+            Some("abdomen".to_string())
+        );
+    }
+
+    #[test]
+    fn test_total_chars_typed_on_submit() {
+        let mut room = Room::new("TEST".to_string());
+        room.init_player_states();
+
+        room.submit_word(1, "abacus"); // 6 chars
+        assert_eq!(room.player1_state.as_ref().unwrap().total_chars_typed, 6);
+
+        room.submit_word(1, "abdomen"); // 7 chars
+        assert_eq!(room.player1_state.as_ref().unwrap().total_chars_typed, 13);
+    }
+
+    #[test]
+    fn test_total_chars_typed_on_complete() {
+        let mut room = Room::new("TEST".to_string());
+        room.init_player_states();
+
+        // Player 2 sends words to player 1's queue
+        room.submit_word(2, "abacus"); // 6 chars in P1's queue
+        room.submit_word(2, "abide");  // 5 chars in P1's queue
+
+        // Player 1 completes them
+        room.complete_word(1, "abacus");
+        assert_eq!(room.player1_state.as_ref().unwrap().total_chars_typed, 6);
+
+        room.complete_word(1, "abide");
+        assert_eq!(room.player1_state.as_ref().unwrap().total_chars_typed, 11);
+    }
+
+    #[test]
+    fn test_get_game_stats_basic() {
+        let mut room = Room::new("TEST".to_string());
+        room.init_player_states();
+        room.game_started_at = Some(Instant::now());
+
+        room.submit_word(1, "abacus");
+        room.submit_word(1, "abdomen");
+        room.submit_word(2, "abide");
+
+        // Player 1 completes the word from player 2
+        room.complete_word(1, "abide");
+
+        let stats = room.get_game_stats(1, "queue_overflow");
+        assert_eq!(stats["type"], "game_over");
+        assert_eq!(stats["reason"], "queue_overflow");
+        assert_eq!(stats["winner"], 1);
+        assert_eq!(stats["loser"], 2);
+        assert_eq!(stats["stats"]["player1"]["words_sent"], 2);
+        assert_eq!(stats["stats"]["player1"]["words_completed"], 1);
+        assert_eq!(stats["stats"]["player1"]["longest_word_sent"], "abdomen");
+        assert_eq!(stats["stats"]["player2"]["words_sent"], 1);
+        assert_eq!(stats["stats"]["player2"]["words_completed"], 0);
+        assert_eq!(stats["stats"]["player2"]["longest_word_sent"], "abide");
+    }
+
+    #[test]
+    fn test_game_started_at_tracking() {
+        let mut room = Room::new("TEST".to_string());
+        assert!(room.game_started_at.is_none());
+        room.game_started_at = Some(Instant::now());
+        assert!(room.game_started_at.is_some());
+    }
+
+    #[test]
+    fn test_play_again_single_player() {
+        let mut room = Room::new("TEST".to_string());
+        room.state = RoomState::GameOver;
+
+        let both = room.set_play_again(1);
+        assert!(!both);
+        assert!(room.player1_play_again);
+        assert!(!room.player2_play_again);
+    }
+
+    #[test]
+    fn test_play_again_both_players() {
+        let mut room = Room::new("TEST".to_string());
+        room.state = RoomState::GameOver;
+
+        room.set_play_again(1);
+        let both = room.set_play_again(2);
+        assert!(both);
+    }
+
+    #[test]
+    fn test_reset_for_rematch() {
+        let mut room = Room::new("TEST".to_string());
+        room.init_player_states();
+        room.state = RoomState::GameOver;
+        room.player1_ready = true;
+        room.player2_ready = true;
+        room.player1_play_again = true;
+        room.player2_play_again = true;
+        room.game_started_at = Some(Instant::now());
+
+        // Modify player states
+        room.submit_word(1, "abacus");
+
+        room.reset_for_rematch();
+
+        assert_eq!(room.state, RoomState::WaitingForReady);
+        assert!(!room.player1_ready);
+        assert!(!room.player2_ready);
+        assert!(!room.player1_play_again);
+        assert!(!room.player2_play_again);
+        assert!(room.player1_state.is_none());
+        assert!(room.player2_state.is_none());
+        assert!(room.game_started_at.is_none());
+    }
+
+    #[test]
+    fn test_no_overflow_below_threshold() {
+        let mut room = Room::new("TEST".to_string());
+        room.init_player_states();
+
+        let words = [
+            "abacus", "abdomen", "abide", "ablaze", "able",
+            "abnormal", "abrasion", "abrasive", "abstract",
+        ];
+
+        for word in &words {
+            room.submit_word(1, word);
+        }
+        // 9 words, below threshold
+        assert_eq!(room.check_overflow(1), None);
     }
 }
