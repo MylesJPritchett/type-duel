@@ -59,6 +59,26 @@ pub async fn game_page(Path(code): Path<String>) -> Html<String> {
   #feedback {{ min-height: 1.5em; margin-top: 10px; font-weight: bold; }}
   #feedback.error {{ color: #e74c3c; }}
   #feedback.success {{ color: #2ecc71; }}
+  #defense-area {{ display: none; margin-top: 20px; }}
+  #defense-area.visible {{ display: block; }}
+  #defense-word {{
+    font-size: 2.5em; letter-spacing: 0.05em; margin: 20px 0;
+    font-family: monospace; min-height: 1.5em;
+  }}
+  #defense-word .correct {{ color: #2ecc71; }}
+  #defense-word .wrong {{ color: #e74c3c; text-decoration: underline; }}
+  #defense-word .pending {{ color: #888; }}
+  #defense-queue {{
+    display: flex; justify-content: center; gap: 12px;
+    flex-wrap: wrap; margin: 10px 0; min-height: 2em;
+  }}
+  #defense-queue .queue-word {{
+    padding: 4px 10px; border-radius: 4px;
+    background: #eee; font-size: 1.1em;
+  }}
+  #defense-queue .queue-word.current {{
+    background: #3498db; color: white; font-weight: bold;
+  }}
 </style>
 </head>
 <body>
@@ -72,6 +92,13 @@ pub async fn game_page(Path(code): Path<String>) -> Html<String> {
   <input type="text" id="word-input" placeholder="Type a word..." autocomplete="off" />
   <div id="feedback"></div>
 </div>
+<div id="defense-area">
+  <div class="queue-display">Opponent: <span id="defense-opponent-queue">0</span> words</div>
+  <div class="queue-display">Your queue: <span id="defense-your-queue">0</span> words</div>
+  <div id="defense-queue"></div>
+  <div id="defense-word"></div>
+  <div id="defense-feedback"></div>
+</div>
 <script>
   const code = "{code}";
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -81,11 +108,22 @@ pub async fn game_page(Path(code): Path<String>) -> Html<String> {
   const overlay = document.getElementById('countdown-overlay');
   const countdownText = document.getElementById('countdown-text');
   const attackArea = document.getElementById('attack-area');
+  const defenseArea = document.getElementById('defense-area');
   const wordInput = document.getElementById('word-input');
   const feedbackEl = document.getElementById('feedback');
   const opponentQueueEl = document.getElementById('opponent-queue');
   const yourQueueEl = document.getElementById('your-queue');
+  const defenseOpponentQueueEl = document.getElementById('defense-opponent-queue');
+  const defenseYourQueueEl = document.getElementById('defense-your-queue');
+  const defenseQueueEl = document.getElementById('defense-queue');
+  const defenseWordEl = document.getElementById('defense-word');
   let feedbackTimeout = null;
+
+  let gameMode = 'attack'; // 'attack' or 'defense'
+  let defenseQueue = [];
+  let currentDefenseWord = '';
+  let typedChars = '';
+  let gameActive = false;
 
   ws.onopen = () => {{
     statusEl.textContent = 'Connected, waiting for game data...';
@@ -96,6 +134,75 @@ pub async fn game_page(Path(code): Path<String>) -> Html<String> {
     readyBtn.disabled = true;
     readyBtn.textContent = 'Waiting...';
   }};
+
+  function switchToDefense() {{
+    gameMode = 'defense';
+    attackArea.classList.remove('visible');
+    defenseArea.classList.add('visible');
+    currentDefenseWord = defenseQueue[0] || '';
+    typedChars = '';
+    renderDefenseWord();
+    renderDefenseQueue();
+  }}
+
+  function switchToAttack() {{
+    gameMode = 'attack';
+    defenseArea.classList.remove('visible');
+    attackArea.classList.add('visible');
+    wordInput.focus();
+  }}
+
+  function renderDefenseWord() {{
+    if (!currentDefenseWord) {{
+      defenseWordEl.innerHTML = '';
+      return;
+    }}
+    let html = '';
+    for (let i = 0; i < currentDefenseWord.length; i++) {{
+      if (i < typedChars.length) {{
+        if (typedChars[i] === currentDefenseWord[i]) {{
+          html += `<span class="correct">${{currentDefenseWord[i]}}</span>`;
+        }} else {{
+          html += `<span class="wrong">${{typedChars[i]}}</span>`;
+        }}
+      }} else {{
+        html += `<span class="pending">${{currentDefenseWord[i]}}</span>`;
+      }}
+    }}
+    defenseWordEl.innerHTML = html;
+  }}
+
+  function renderDefenseQueue() {{
+    let html = '';
+    for (let i = 0; i < defenseQueue.length; i++) {{
+      const cls = i === 0 ? 'queue-word current' : 'queue-word';
+      html += `<span class="${{cls}}">${{defenseQueue[i]}}</span>`;
+    }}
+    defenseQueueEl.innerHTML = html;
+  }}
+
+  function updateQueueDisplays(yourQueue, opponentQueue) {{
+    yourQueueEl.textContent = yourQueue;
+    opponentQueueEl.textContent = opponentQueue;
+    defenseYourQueueEl.textContent = yourQueue;
+    defenseOpponentQueueEl.textContent = opponentQueue;
+  }}
+
+  function completeDefenseWord() {{
+    const word = currentDefenseWord;
+    ws.send(JSON.stringify({{"type": "word_completed", "word": word}}));
+    defenseQueue.shift();
+    if (defenseQueue.length > 0) {{
+      currentDefenseWord = defenseQueue[0];
+      typedChars = '';
+      renderDefenseWord();
+      renderDefenseQueue();
+    }} else {{
+      currentDefenseWord = '';
+      typedChars = '';
+      switchToAttack();
+    }}
+  }}
 
   ws.onmessage = (event) => {{
     const msg = JSON.parse(event.data);
@@ -113,8 +220,8 @@ pub async fn game_page(Path(code): Path<String>) -> Html<String> {
       overlay.classList.remove('visible');
       readyBtn.style.display = 'none';
       statusEl.textContent = 'Game in progress!';
-      attackArea.classList.add('visible');
-      wordInput.focus();
+      gameActive = true;
+      switchToAttack();
     }} else if (msg.type === 'room_full') {{
       statusEl.textContent = 'Room is full!';
     }} else if (msg.type === 'word_sent') {{
@@ -128,10 +235,25 @@ pub async fn game_page(Path(code): Path<String>) -> Html<String> {
       }};
       showFeedback(reasons[msg.reason] || msg.reason, 'error');
     }} else if (msg.type === 'word_received') {{
-      // Will be used for defense mode in Ticket 4
+      defenseQueue.push(msg.word);
+      if (gameMode === 'defense') {{
+        renderDefenseQueue();
+      }} else {{
+        // If in attack mode and no word is being typed, switch to defense
+        if (!wordInput.value.trim()) {{
+          switchToDefense();
+        }}
+        // Otherwise, queue builds up and switches after current attack word is submitted
+      }}
     }} else if (msg.type === 'queue_update') {{
-      yourQueueEl.textContent = msg.your_queue;
-      opponentQueueEl.textContent = msg.opponent_queue;
+      updateQueueDisplays(msg.your_queue, msg.opponent_queue);
+    }} else if (msg.type === 'game_over') {{
+      gameActive = false;
+      statusEl.textContent = msg.winner
+        ? `Game Over! Player ${{msg.winner}} wins (${{msg.reason}})`
+        : `Game Over! (${{msg.reason}})`;
+      attackArea.classList.remove('visible');
+      defenseArea.classList.remove('visible');
     }}
   }};
 
@@ -154,13 +276,40 @@ pub async fn game_page(Path(code): Path<String>) -> Html<String> {
       if (word) {{
         ws.send(JSON.stringify({{"type": "submit_word", "word": word}}));
         wordInput.value = '';
+        // After submitting attack word, switch to defense if queue has words
+        if (defenseQueue.length > 0) {{
+          switchToDefense();
+        }}
       }}
+    }}
+  }});
+
+  // Defense mode: listen for keydown on document
+  document.addEventListener('keydown', (e) => {{
+    if (gameMode !== 'defense' || !gameActive) return;
+    if (e.key === 'Backspace') {{
+      e.preventDefault();
+      if (typedChars.length > 0) {{
+        typedChars = typedChars.slice(0, -1);
+        renderDefenseWord();
+      }}
+      return;
+    }}
+    // Only handle single printable characters
+    if (e.key.length !== 1) return;
+    e.preventDefault();
+    typedChars += e.key.toLowerCase();
+    renderDefenseWord();
+    // Check if word is complete and all correct
+    if (typedChars.length === currentDefenseWord.length && typedChars === currentDefenseWord) {{
+      completeDefenseWord();
     }}
   }});
 
   ws.onclose = () => {{
     if (statusEl.textContent.includes('full')) return;
     statusEl.textContent = 'Disconnected.';
+    gameActive = false;
   }};
 </script>
 </body>
@@ -423,6 +572,50 @@ fn handle_client_message(state: &AppState, code: &str, player_num: u8, text: &st
                                 .to_string(),
                             );
                         }
+                    }
+                }
+            }
+        }
+        Some("word_completed") => {
+            let word = match parsed.get("word").and_then(|w| w.as_str()) {
+                Some(w) => w.to_string(),
+                None => return,
+            };
+
+            let mut rooms = state.rooms.lock().unwrap();
+            if let Some(room) = rooms.get_mut(code) {
+                if room.state != RoomState::Playing {
+                    return;
+                }
+
+                let success = room.complete_word(player_num, &word);
+                if success {
+                    // Send queue_update to both players
+                    let p1_queue = room.queue_len(1);
+                    let p2_queue = room.queue_len(2);
+
+                    // Player 1's perspective
+                    if let Some(tx) = room.player_txs.first() {
+                        let _ = tx.send(
+                            serde_json::json!({
+                                "type": "queue_update",
+                                "your_queue": p1_queue,
+                                "opponent_queue": p2_queue
+                            })
+                            .to_string(),
+                        );
+                    }
+
+                    // Player 2's perspective
+                    if let Some(tx) = room.player_txs.get(1) {
+                        let _ = tx.send(
+                            serde_json::json!({
+                                "type": "queue_update",
+                                "your_queue": p2_queue,
+                                "opponent_queue": p1_queue
+                            })
+                            .to_string(),
+                        );
                     }
                 }
             }

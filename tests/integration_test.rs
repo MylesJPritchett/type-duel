@@ -482,6 +482,135 @@ async fn test_disconnect_player2_gives_player1_win() {
 }
 
 #[tokio::test]
+async fn test_word_completed_decrements_queue() {
+    let base_url = start_server().await;
+    let (mut ws1, mut ws2) = setup_playing_game(&base_url).await;
+
+    // Player 1 sends a word to Player 2
+    send_json(&mut ws1, serde_json::json!({"type": "submit_word", "word": "abacus"})).await;
+    let _ = recv_json(&mut ws1).await; // word_sent
+    let _ = recv_json(&mut ws2).await; // word_received
+    let _ = recv_json(&mut ws1).await; // queue_update for p1
+    let _ = recv_json(&mut ws2).await; // queue_update for p2
+
+    // Player 2 completes the word
+    send_json(&mut ws2, serde_json::json!({"type": "word_completed", "word": "abacus"})).await;
+
+    // Both should get queue_update with decremented queue
+    let msg2 = recv_json(&mut ws2).await;
+    assert_eq!(msg2["type"], "queue_update");
+    assert_eq!(msg2["your_queue"], 0);
+    assert_eq!(msg2["opponent_queue"], 0);
+
+    let msg1 = recv_json(&mut ws1).await;
+    assert_eq!(msg1["type"], "queue_update");
+    assert_eq!(msg1["your_queue"], 0);
+    assert_eq!(msg1["opponent_queue"], 0);
+
+    ws1.close(None).await.unwrap();
+    ws2.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_full_attack_defend_cycle() {
+    let base_url = start_server().await;
+    let (mut ws1, mut ws2) = setup_playing_game(&base_url).await;
+
+    // Player 1 sends a word
+    send_json(&mut ws1, serde_json::json!({"type": "submit_word", "word": "abacus"})).await;
+    let _ = recv_json(&mut ws1).await; // word_sent
+    let msg = recv_json(&mut ws2).await; // word_received
+    assert_eq!(msg["type"], "word_received");
+    assert_eq!(msg["word"], "abacus");
+    let _ = recv_json(&mut ws1).await; // queue_update
+    let msg = recv_json(&mut ws2).await; // queue_update
+    assert_eq!(msg["your_queue"], 1);
+
+    // Player 2 completes the defense word
+    send_json(&mut ws2, serde_json::json!({"type": "word_completed", "word": "abacus"})).await;
+
+    // Queue should be empty now
+    let msg = recv_json(&mut ws2).await;
+    assert_eq!(msg["type"], "queue_update");
+    assert_eq!(msg["your_queue"], 0);
+
+    let msg = recv_json(&mut ws1).await;
+    assert_eq!(msg["type"], "queue_update");
+    assert_eq!(msg["opponent_queue"], 0);
+
+    ws1.close(None).await.unwrap();
+    ws2.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_multiple_words_completed_in_order() {
+    let base_url = start_server().await;
+    let (mut ws1, mut ws2) = setup_playing_game(&base_url).await;
+
+    // Player 1 sends 3 words to Player 2
+    let words = ["abacus", "abdomen", "abide"];
+    for word in &words {
+        send_json(&mut ws1, serde_json::json!({"type": "submit_word", "word": word})).await;
+        let _ = recv_json(&mut ws1).await; // word_sent
+        let _ = recv_json(&mut ws2).await; // word_received
+        let _ = recv_json(&mut ws1).await; // queue_update
+        let _ = recv_json(&mut ws2).await; // queue_update
+    }
+
+    // Player 2 completes them in order
+    for (i, word) in words.iter().enumerate() {
+        send_json(&mut ws2, serde_json::json!({"type": "word_completed", "word": word})).await;
+
+        let msg2 = recv_json(&mut ws2).await;
+        assert_eq!(msg2["type"], "queue_update");
+        assert_eq!(msg2["your_queue"], (2 - i) as u64);
+
+        let msg1 = recv_json(&mut ws1).await;
+        assert_eq!(msg1["type"], "queue_update");
+        assert_eq!(msg1["opponent_queue"], (2 - i) as u64);
+    }
+
+    ws1.close(None).await.unwrap();
+    ws2.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_word_completed_wrong_word_ignored() {
+    let base_url = start_server().await;
+    let (mut ws1, mut ws2) = setup_playing_game(&base_url).await;
+
+    // Player 1 sends a word
+    send_json(&mut ws1, serde_json::json!({"type": "submit_word", "word": "abacus"})).await;
+    let _ = recv_json(&mut ws1).await; // word_sent
+    let _ = recv_json(&mut ws2).await; // word_received
+    let _ = recv_json(&mut ws1).await; // queue_update
+    let _ = recv_json(&mut ws2).await; // queue_update
+
+    // Player 2 tries to complete with wrong word
+    send_json(&mut ws2, serde_json::json!({"type": "word_completed", "word": "wrong"})).await;
+
+    // No queue_update should be sent (wrong word)
+    let result = tokio::time::timeout(std::time::Duration::from_millis(300), ws2.next()).await;
+    assert!(result.is_err(), "Should not receive update for wrong word");
+
+    ws1.close(None).await.unwrap();
+    ws2.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_game_page_has_defense_display() {
+    let base_url = start_server().await;
+    let code = create_room(&base_url).await;
+    let res = reqwest::get(format!("{base_url}/game/{code}"))
+        .await
+        .unwrap();
+    let body = res.text().await.unwrap();
+    assert!(body.contains("defense-area"), "Game page should have defense area");
+    assert!(body.contains("defense-queue"), "Game page should have defense queue display");
+    assert!(body.contains("word_completed"), "Game page should handle word_completed");
+}
+
+#[tokio::test]
 async fn test_game_page_has_ready_button() {
     let base_url = start_server().await;
     let code = create_room(&base_url).await;

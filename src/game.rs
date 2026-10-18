@@ -25,6 +25,8 @@ pub struct PlayerState {
     pub last_sent_word: Option<String>,
     /// Counter of words successfully sent to opponent
     pub words_sent: u32,
+    /// Counter of words successfully completed (defended)
+    pub words_completed: u32,
 }
 
 impl PlayerState {
@@ -33,6 +35,7 @@ impl PlayerState {
             defense_queue: Vec::new(),
             last_sent_word: None,
             words_sent: 0,
+            words_completed: 0,
         }
     }
 }
@@ -178,6 +181,33 @@ impl Room {
                 .unwrap_or(0),
             _ => 0,
         }
+    }
+
+    /// Complete a defense word for a player. The word must match the front of their queue.
+    /// Returns true if successful (word matched and was removed).
+    pub fn complete_word(&mut self, player_num: u8, word: &str) -> bool {
+        let player_state = match player_num {
+            1 => self.player1_state.as_mut(),
+            2 => self.player2_state.as_mut(),
+            _ => return false,
+        };
+
+        let state = match player_state {
+            Some(s) => s,
+            None => return false,
+        };
+
+        if state.defense_queue.is_empty() {
+            return false;
+        }
+
+        if state.defense_queue[0] != word {
+            return false;
+        }
+
+        state.defense_queue.remove(0);
+        state.words_completed += 1;
+        true
     }
 
     /// Check if the room is currently in a playing state
@@ -538,6 +568,83 @@ mod tests {
         assert_eq!(room.queue_len(2), 1);
         room.submit_word(1, "abide");
         assert_eq!(room.queue_len(2), 2);
+    }
+
+    #[test]
+    fn test_complete_word_succeeds_when_matching_front() {
+        let mut room = Room::new("TEST".to_string());
+        room.init_player_states();
+        // Add a word to player 1's defense queue
+        room.submit_word(2, "abacus"); // P2 sends, goes to P1's queue
+        assert_eq!(room.queue_len(1), 1);
+
+        let result = room.complete_word(1, "abacus");
+        assert!(result);
+        assert_eq!(room.queue_len(1), 0);
+        assert_eq!(room.player1_state.as_ref().unwrap().words_completed, 1);
+    }
+
+    #[test]
+    fn test_complete_word_fails_when_not_matching() {
+        let mut room = Room::new("TEST".to_string());
+        room.init_player_states();
+        room.submit_word(2, "abacus");
+
+        let result = room.complete_word(1, "wrong");
+        assert!(!result);
+        assert_eq!(room.queue_len(1), 1); // Queue unchanged
+        assert_eq!(room.player1_state.as_ref().unwrap().words_completed, 0);
+    }
+
+    #[test]
+    fn test_complete_word_on_empty_queue() {
+        let mut room = Room::new("TEST".to_string());
+        room.init_player_states();
+
+        let result = room.complete_word(1, "anything");
+        assert!(!result);
+        assert_eq!(room.player1_state.as_ref().unwrap().words_completed, 0);
+    }
+
+    #[test]
+    fn test_complete_word_increments_counter() {
+        let mut room = Room::new("TEST".to_string());
+        room.init_player_states();
+        room.submit_word(2, "abacus");
+        room.submit_word(2, "abide");
+
+        room.complete_word(1, "abacus");
+        assert_eq!(room.player1_state.as_ref().unwrap().words_completed, 1);
+        room.complete_word(1, "abide");
+        assert_eq!(room.player1_state.as_ref().unwrap().words_completed, 2);
+    }
+
+    #[test]
+    fn test_complete_word_shifts_queue() {
+        let mut room = Room::new("TEST".to_string());
+        room.init_player_states();
+        room.submit_word(2, "abacus");
+        room.submit_word(2, "abdomen");
+        room.submit_word(2, "abide");
+
+        assert_eq!(room.queue_len(1), 3);
+
+        // Complete first word
+        assert!(room.complete_word(1, "abacus"));
+        assert_eq!(room.queue_len(1), 2);
+        // Next word should now be at front
+        assert_eq!(
+            room.player1_state.as_ref().unwrap().defense_queue[0],
+            "abdomen"
+        );
+
+        // Complete second word
+        assert!(room.complete_word(1, "abdomen"));
+        assert_eq!(room.queue_len(1), 1);
+        assert_eq!(
+            room.player1_state.as_ref().unwrap().defense_queue[0],
+            "abide"
+        );
     }
 
     #[test]
