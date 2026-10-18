@@ -228,6 +228,80 @@ async fn test_both_ready_triggers_countdown_and_game_start() {
     ws2.close(None).await.unwrap();
 }
 
+type WsStream = tokio_tungstenite::WebSocketStream<
+    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+>;
+
+/// Helper: connect two players, ready up, wait for countdown + game_start.
+/// Returns both WebSocket streams in the Playing state.
+async fn setup_playing_game(base_url: &str) -> (WsStream, WsStream) {
+    let code = create_room(base_url).await;
+    let ws_url = base_url.replace("http://", "ws://");
+
+    let (mut ws1, _) = connect_async(format!("{ws_url}/ws/{code}")).await.unwrap();
+    let _ = recv_json(&mut ws1).await; // room_joined
+
+    let (mut ws2, _) = connect_async(format!("{ws_url}/ws/{code}")).await.unwrap();
+    let _ = recv_json(&mut ws2).await; // room_joined
+    let _ = recv_json(&mut ws1).await; // player_joined
+
+    // waiting_for_ready
+    let _ = recv_json(&mut ws1).await;
+    let _ = recv_json(&mut ws2).await;
+
+    // Both ready up
+    send_json(&mut ws1, serde_json::json!({"type": "ready"})).await;
+    send_json(&mut ws2, serde_json::json!({"type": "ready"})).await;
+
+    // Consume countdown 3,2,1,0
+    for _ in 0..4 {
+        let _ = recv_json(&mut ws1).await;
+        let _ = recv_json(&mut ws2).await;
+    }
+
+    // game_start
+    let msg1 = recv_json(&mut ws1).await;
+    assert_eq!(msg1["type"], "game_start");
+    let msg2 = recv_json(&mut ws2).await;
+    assert_eq!(msg2["type"], "game_start");
+
+    (ws1, ws2)
+}
+
+#[tokio::test]
+async fn test_disconnect_during_playing_gives_opponent_win() {
+    let base_url = start_server().await;
+    let (ws1, mut ws2) = setup_playing_game(&base_url).await;
+
+    // Player 1 disconnects
+    drop(ws1);
+
+    // Player 2 should receive game_over after timeout
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(10), recv_json(&mut ws2))
+        .await
+        .expect("timed out waiting for game_over");
+    assert_eq!(msg["type"], "game_over");
+    assert_eq!(msg["reason"], "opponent_disconnected");
+    assert_eq!(msg["winner"], 2);
+}
+
+#[tokio::test]
+async fn test_disconnect_player2_gives_player1_win() {
+    let base_url = start_server().await;
+    let (mut ws1, ws2) = setup_playing_game(&base_url).await;
+
+    // Player 2 disconnects
+    drop(ws2);
+
+    // Player 1 should receive game_over after timeout
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(10), recv_json(&mut ws1))
+        .await
+        .expect("timed out waiting for game_over");
+    assert_eq!(msg["type"], "game_over");
+    assert_eq!(msg["reason"], "opponent_disconnected");
+    assert_eq!(msg["winner"], 1);
+}
+
 #[tokio::test]
 async fn test_game_page_has_ready_button() {
     let base_url = start_server().await;

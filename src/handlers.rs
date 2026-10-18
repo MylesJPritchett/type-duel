@@ -104,6 +104,9 @@ pub async fn game_page(Path(code): Path<String>) -> Html<String> {
     ))
 }
 
+/// The disconnect timeout duration in seconds
+const DISCONNECT_TIMEOUT_SECS: u64 = 5;
+
 /// WebSocket upgrade handler for /ws/:code
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
@@ -184,6 +187,45 @@ async fn handle_socket(mut socket: WebSocket, code: String, state: AppState) {
                         }
                     }
                 }
+            }
+
+            // Player disconnected — check if we should trigger game_over
+            let is_playing = {
+                let rooms = state.rooms.lock().unwrap();
+                rooms.get(&code).map_or(false, |r| r.is_playing())
+            };
+
+            if is_playing {
+                let other_player = if player_num == 1 { 2u8 } else { 1u8 };
+                let other_tx = {
+                    let rooms = state.rooms.lock().unwrap();
+                    rooms.get(&code).and_then(|room| {
+                        room.player_txs.get((other_player - 1) as usize).cloned()
+                    })
+                };
+                let state_clone = state.clone();
+                let code_clone = code.clone();
+
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(DISCONNECT_TIMEOUT_SECS)).await;
+
+                    let still_playing = {
+                        let rooms = state_clone.rooms.lock().unwrap();
+                        rooms.get(&code_clone).map_or(false, |r| r.is_playing())
+                    };
+
+                    if still_playing {
+                        if let Some(tx) = other_tx {
+                            let game_over_msg = serde_json::json!({
+                                "type": "game_over",
+                                "reason": "opponent_disconnected",
+                                "winner": other_player
+                            });
+                            let _ = tx.send(game_over_msg.to_string());
+                        }
+                        game::set_room_state(&state_clone, &code_clone, RoomState::GameOver);
+                    }
+                });
             }
 
             game::leave_room(&state, &code);

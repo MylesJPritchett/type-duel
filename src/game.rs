@@ -11,6 +11,7 @@ pub enum RoomState {
     WaitingForReady,
     Countdown,
     Playing,
+    GameOver,
 }
 
 /// Represents a game room
@@ -64,6 +65,11 @@ impl Room {
     /// Check if both players are ready
     pub fn both_ready(&self) -> bool {
         self.player1_ready && self.player2_ready
+    }
+
+    /// Check if the room is currently in a playing state
+    pub fn is_playing(&self) -> bool {
+        self.state == RoomState::Playing
     }
 }
 
@@ -129,6 +135,14 @@ pub fn join_room(state: &AppState, code: &str) -> JoinResult {
             }
         }
         None => JoinResult::NotFound,
+    }
+}
+
+/// Set the state of a room
+pub fn set_room_state(state: &AppState, code: &str, room_state: RoomState) {
+    let mut rooms = state.rooms.lock().unwrap();
+    if let Some(room) = rooms.get_mut(code) {
+        room.state = room_state;
     }
 }
 
