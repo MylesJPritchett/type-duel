@@ -4,6 +4,8 @@ use std::sync::{Arc, Mutex};
 use rand::Rng;
 use tokio::sync::mpsc;
 
+use crate::dictionary;
+
 /// Room lifecycle states
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoomState {
@@ -11,6 +13,42 @@ pub enum RoomState {
     WaitingForReady,
     Countdown,
     Playing,
+}
+
+/// Per-player game state during a match
+#[derive(Debug, Clone)]
+pub struct PlayerState {
+    /// Words from opponent that this player must type (defense queue)
+    pub defense_queue: Vec<String>,
+    /// Last word sent, for back-to-back duplicate prevention
+    pub last_sent_word: Option<String>,
+    /// Counter of words successfully sent to opponent
+    pub words_sent: u32,
+}
+
+impl PlayerState {
+    pub fn new() -> Self {
+        PlayerState {
+            defense_queue: Vec::new(),
+            last_sent_word: None,
+            words_sent: 0,
+        }
+    }
+}
+
+/// Result of attempting to submit a word
+#[derive(Debug, PartialEq)]
+pub enum WordSubmitResult {
+    /// Word was valid and added to opponent's defense queue
+    Sent { word: String },
+    /// Word is not in the dictionary
+    InvalidWord,
+    /// Word is too short (less than 3 characters)
+    TooShort,
+    /// Word contains non-lowercase-letter characters
+    InvalidChars,
+    /// Same word as last sent (back-to-back duplicate)
+    BackToBackDuplicate,
 }
 
 /// Represents a game room
@@ -23,6 +61,10 @@ pub struct Room {
     pub player2_ready: bool,
     /// Per-player sender channels for broadcasting messages
     pub player_txs: Vec<mpsc::UnboundedSender<String>>,
+    /// Player 1 game state (initialized when game starts)
+    pub player1_state: Option<PlayerState>,
+    /// Player 2 game state (initialized when game starts)
+    pub player2_state: Option<PlayerState>,
 }
 
 impl Room {
@@ -34,6 +76,8 @@ impl Room {
             player1_ready: false,
             player2_ready: false,
             player_txs: Vec::new(),
+            player1_state: None,
+            player2_state: None,
         }
     }
 
@@ -64,6 +108,75 @@ impl Room {
     /// Check if both players are ready
     pub fn both_ready(&self) -> bool {
         self.player1_ready && self.player2_ready
+    }
+
+    /// Initialize player states when the game starts
+    pub fn init_player_states(&mut self) {
+        self.player1_state = Some(PlayerState::new());
+        self.player2_state = Some(PlayerState::new());
+    }
+
+    /// Submit a word from a player. Validates and adds to opponent's defense queue.
+    /// player_num is 1 or 2.
+    pub fn submit_word(&mut self, player_num: u8, word: &str) -> WordSubmitResult {
+        // Validate the word using dictionary module (checks length, chars, and dictionary)
+        if let Some(reason) = dictionary::validate_word(word) {
+            return match reason {
+                "too_short" => WordSubmitResult::TooShort,
+                "invalid_chars" => WordSubmitResult::InvalidChars,
+                "not_in_dictionary" => WordSubmitResult::InvalidWord,
+                _ => WordSubmitResult::InvalidWord,
+            };
+        }
+
+        // Get the submitter's state to check for back-to-back duplicate
+        let submitter_state = match player_num {
+            1 => self.player1_state.as_mut(),
+            2 => self.player2_state.as_mut(),
+            _ => return WordSubmitResult::InvalidWord,
+        };
+
+        let submitter = submitter_state.expect("player state not initialized");
+
+        // Check for back-to-back duplicate
+        if submitter.last_sent_word.as_deref() == Some(word) {
+            return WordSubmitResult::BackToBackDuplicate;
+        }
+
+        // Update submitter's state
+        submitter.last_sent_word = Some(word.to_string());
+        submitter.words_sent += 1;
+
+        // Add to opponent's defense queue
+        let opponent_state = match player_num {
+            1 => self.player2_state.as_mut(),
+            2 => self.player1_state.as_mut(),
+            _ => unreachable!(),
+        };
+
+        let opponent = opponent_state.expect("opponent state not initialized");
+        opponent.defense_queue.push(word.to_string());
+
+        WordSubmitResult::Sent {
+            word: word.to_string(),
+        }
+    }
+
+    /// Get the defense queue length for a player
+    pub fn queue_len(&self, player_num: u8) -> usize {
+        match player_num {
+            1 => self
+                .player1_state
+                .as_ref()
+                .map(|s| s.defense_queue.len())
+                .unwrap_or(0),
+            2 => self
+                .player2_state
+                .as_ref()
+                .map(|s| s.defense_queue.len())
+                .unwrap_or(0),
+            _ => 0,
+        }
     }
 }
 
@@ -274,6 +387,143 @@ mod tests {
 
         assert_eq!(rx1.try_recv().unwrap(), r#"{"type":"test"}"#);
         assert_eq!(rx2.try_recv().unwrap(), r#"{"type":"test"}"#);
+    }
+
+    #[test]
+    fn test_player_state_new() {
+        let state = PlayerState::new();
+        assert!(state.defense_queue.is_empty());
+        assert!(state.last_sent_word.is_none());
+        assert_eq!(state.words_sent, 0);
+    }
+
+    #[test]
+    fn test_init_player_states() {
+        let mut room = Room::new("TEST".to_string());
+        assert!(room.player1_state.is_none());
+        assert!(room.player2_state.is_none());
+        room.init_player_states();
+        assert!(room.player1_state.is_some());
+        assert!(room.player2_state.is_some());
+    }
+
+    #[test]
+    fn test_submit_word_valid() {
+        let mut room = Room::new("TEST".to_string());
+        room.init_player_states();
+        // "abacus" is in the EFF wordlist
+        let result = room.submit_word(1, "abacus");
+        assert_eq!(
+            result,
+            WordSubmitResult::Sent {
+                word: "abacus".to_string()
+            }
+        );
+        // Should be in player 2's defense queue
+        assert_eq!(room.player2_state.as_ref().unwrap().defense_queue.len(), 1);
+        assert_eq!(
+            room.player2_state.as_ref().unwrap().defense_queue[0],
+            "abacus"
+        );
+        // Player 1's stats should be updated
+        assert_eq!(room.player1_state.as_ref().unwrap().words_sent, 1);
+        assert_eq!(
+            room.player1_state.as_ref().unwrap().last_sent_word,
+            Some("abacus".to_string())
+        );
+    }
+
+    #[test]
+    fn test_submit_word_too_short() {
+        let mut room = Room::new("TEST".to_string());
+        room.init_player_states();
+        assert_eq!(room.submit_word(1, "ab"), WordSubmitResult::TooShort);
+        assert_eq!(room.submit_word(1, ""), WordSubmitResult::TooShort);
+    }
+
+    #[test]
+    fn test_submit_word_invalid_chars() {
+        let mut room = Room::new("TEST".to_string());
+        room.init_player_states();
+        assert_eq!(room.submit_word(1, "Hello"), WordSubmitResult::InvalidChars);
+        assert_eq!(
+            room.submit_word(1, "test123"),
+            WordSubmitResult::InvalidChars
+        );
+    }
+
+    #[test]
+    fn test_submit_word_not_in_dictionary() {
+        let mut room = Room::new("TEST".to_string());
+        room.init_player_states();
+        assert_eq!(room.submit_word(1, "zzzzzzz"), WordSubmitResult::InvalidWord);
+    }
+
+    #[test]
+    fn test_submit_word_back_to_back_duplicate() {
+        let mut room = Room::new("TEST".to_string());
+        room.init_player_states();
+        let result = room.submit_word(1, "abacus");
+        assert_eq!(
+            result,
+            WordSubmitResult::Sent {
+                word: "abacus".to_string()
+            }
+        );
+        let result = room.submit_word(1, "abacus");
+        assert_eq!(result, WordSubmitResult::BackToBackDuplicate);
+    }
+
+    #[test]
+    fn test_submit_word_different_word_after_duplicate_check() {
+        let mut room = Room::new("TEST".to_string());
+        room.init_player_states();
+        room.submit_word(1, "abacus");
+        // Different word should work
+        let result = room.submit_word(1, "abide");
+        assert_eq!(
+            result,
+            WordSubmitResult::Sent {
+                word: "abide".to_string()
+            }
+        );
+        // Now sending "abacus" again should work (not back-to-back)
+        let result = room.submit_word(1, "abacus");
+        assert_eq!(
+            result,
+            WordSubmitResult::Sent {
+                word: "abacus".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_submit_word_player2_sends() {
+        let mut room = Room::new("TEST".to_string());
+        room.init_player_states();
+        let result = room.submit_word(2, "abacus");
+        assert_eq!(
+            result,
+            WordSubmitResult::Sent {
+                word: "abacus".to_string()
+            }
+        );
+        // Should be in player 1's defense queue
+        assert_eq!(room.player1_state.as_ref().unwrap().defense_queue.len(), 1);
+        assert_eq!(room.player2_state.as_ref().unwrap().words_sent, 1);
+    }
+
+    #[test]
+    fn test_queue_len() {
+        let mut room = Room::new("TEST".to_string());
+        room.init_player_states();
+        assert_eq!(room.queue_len(1), 0);
+        assert_eq!(room.queue_len(2), 0);
+        room.submit_word(1, "abacus");
+        assert_eq!(room.queue_len(1), 0);
+        assert_eq!(room.queue_len(2), 1);
+        room.submit_word(1, "abide");
+        assert_eq!(room.queue_len(2), 2);
     }
 
     #[test]

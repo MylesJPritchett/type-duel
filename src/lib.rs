@@ -1,3 +1,4 @@
+pub mod dictionary;
 pub mod game;
 pub mod handlers;
 

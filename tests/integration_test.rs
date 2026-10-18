@@ -228,6 +228,232 @@ async fn test_both_ready_triggers_countdown_and_game_start() {
     ws2.close(None).await.unwrap();
 }
 
+/// Helper: connect two players, ready up, wait through countdown and game_start.
+/// Returns (ws1, ws2) in Playing state.
+async fn setup_playing_game(
+    base_url: &str,
+) -> (
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+) {
+    let code = create_room(base_url).await;
+    let ws_url = base_url.replace("http://", "ws://");
+
+    let (mut ws1, _) = connect_async(format!("{ws_url}/ws/{code}")).await.unwrap();
+    let msg = recv_json(&mut ws1).await;
+    assert_eq!(msg["type"], "room_joined");
+    assert_eq!(msg["player"], 1);
+
+    let (mut ws2, _) = connect_async(format!("{ws_url}/ws/{code}")).await.unwrap();
+    let msg = recv_json(&mut ws2).await;
+    assert_eq!(msg["type"], "room_joined");
+    assert_eq!(msg["player"], 2);
+
+    // P1 gets player_joined
+    let _ = recv_json(&mut ws1).await;
+
+    // Both get waiting_for_ready
+    let _ = recv_json(&mut ws1).await;
+    let _ = recv_json(&mut ws2).await;
+
+    // Both ready up
+    send_json(&mut ws1, serde_json::json!({"type": "ready"})).await;
+    send_json(&mut ws2, serde_json::json!({"type": "ready"})).await;
+
+    // Consume countdown 3, 2, 1, 0 for both
+    for _ in [3, 2, 1, 0] {
+        let _ = recv_json(&mut ws1).await;
+        let _ = recv_json(&mut ws2).await;
+    }
+
+    // Consume game_start for both
+    let msg1 = recv_json(&mut ws1).await;
+    assert_eq!(msg1["type"], "game_start");
+    let msg2 = recv_json(&mut ws2).await;
+    assert_eq!(msg2["type"], "game_start");
+
+    (ws1, ws2)
+}
+
+#[tokio::test]
+async fn test_submit_word_valid() {
+    let base_url = start_server().await;
+    let (mut ws1, mut ws2) = setup_playing_game(&base_url).await;
+
+    // Player 1 submits a valid word
+    send_json(&mut ws1, serde_json::json!({"type": "submit_word", "word": "abacus"})).await;
+
+    // Player 1 should get word_sent
+    let msg = recv_json(&mut ws1).await;
+    assert_eq!(msg["type"], "word_sent");
+    assert_eq!(msg["word"], "abacus");
+
+    // Player 2 should get word_received
+    let msg = recv_json(&mut ws2).await;
+    assert_eq!(msg["type"], "word_received");
+    assert_eq!(msg["word"], "abacus");
+
+    // Both should get queue_update
+    let msg1 = recv_json(&mut ws1).await;
+    assert_eq!(msg1["type"], "queue_update");
+    assert_eq!(msg1["your_queue"], 0);
+    assert_eq!(msg1["opponent_queue"], 1);
+
+    let msg2 = recv_json(&mut ws2).await;
+    assert_eq!(msg2["type"], "queue_update");
+    assert_eq!(msg2["your_queue"], 1);
+    assert_eq!(msg2["opponent_queue"], 0);
+
+    ws1.close(None).await.unwrap();
+    ws2.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_submit_word_rejected_not_in_dictionary() {
+    let base_url = start_server().await;
+    let (mut ws1, mut ws2) = setup_playing_game(&base_url).await;
+
+    send_json(&mut ws1, serde_json::json!({"type": "submit_word", "word": "zzzzzzz"})).await;
+
+    // Player 1 should get word_rejected
+    let msg = recv_json(&mut ws1).await;
+    assert_eq!(msg["type"], "word_rejected");
+    assert_eq!(msg["word"], "zzzzzzz");
+    assert_eq!(msg["reason"], "not_in_dictionary");
+
+    // Player 2 should NOT get any message
+    let result = tokio::time::timeout(std::time::Duration::from_millis(300), ws2.next()).await;
+    assert!(result.is_err(), "Opponent should not receive rejected word");
+
+    ws1.close(None).await.unwrap();
+    ws2.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_submit_word_rejected_too_short() {
+    let base_url = start_server().await;
+    let (mut ws1, mut ws2) = setup_playing_game(&base_url).await;
+
+    send_json(&mut ws1, serde_json::json!({"type": "submit_word", "word": "ab"})).await;
+
+    let msg = recv_json(&mut ws1).await;
+    assert_eq!(msg["type"], "word_rejected");
+    assert_eq!(msg["reason"], "too_short");
+
+    // Opponent gets nothing
+    let result = tokio::time::timeout(std::time::Duration::from_millis(300), ws2.next()).await;
+    assert!(result.is_err());
+
+    ws1.close(None).await.unwrap();
+    ws2.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_submit_word_rejected_invalid_chars() {
+    let base_url = start_server().await;
+    let (mut ws1, mut ws2) = setup_playing_game(&base_url).await;
+
+    send_json(&mut ws1, serde_json::json!({"type": "submit_word", "word": "Hello"})).await;
+
+    let msg = recv_json(&mut ws1).await;
+    assert_eq!(msg["type"], "word_rejected");
+    assert_eq!(msg["reason"], "invalid_chars");
+
+    let result = tokio::time::timeout(std::time::Duration::from_millis(300), ws2.next()).await;
+    assert!(result.is_err());
+
+    ws1.close(None).await.unwrap();
+    ws2.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_submit_word_back_to_back_duplicate() {
+    let base_url = start_server().await;
+    let (mut ws1, mut ws2) = setup_playing_game(&base_url).await;
+
+    // First submission should succeed
+    send_json(&mut ws1, serde_json::json!({"type": "submit_word", "word": "abacus"})).await;
+    let _ = recv_json(&mut ws1).await; // word_sent
+    let _ = recv_json(&mut ws2).await; // word_received
+    let _ = recv_json(&mut ws1).await; // queue_update for p1
+    let _ = recv_json(&mut ws2).await; // queue_update for p2
+
+    // Same word again should be rejected
+    send_json(&mut ws1, serde_json::json!({"type": "submit_word", "word": "abacus"})).await;
+    let msg = recv_json(&mut ws1).await;
+    assert_eq!(msg["type"], "word_rejected");
+    assert_eq!(msg["reason"], "back_to_back_duplicate");
+
+    ws1.close(None).await.unwrap();
+    ws2.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_submit_word_not_allowed_before_playing() {
+    let base_url = start_server().await;
+    let code = create_room(&base_url).await;
+    let ws_url = base_url.replace("http://", "ws://");
+
+    let (mut ws1, _) = connect_async(format!("{ws_url}/ws/{code}")).await.unwrap();
+    let _ = recv_json(&mut ws1).await; // room_joined
+
+    // Try submitting a word before game starts (WaitingForPlayers state)
+    send_json(&mut ws1, serde_json::json!({"type": "submit_word", "word": "abacus"})).await;
+
+    // Should not receive any response
+    let result = tokio::time::timeout(std::time::Duration::from_millis(300), ws1.next()).await;
+    assert!(result.is_err(), "Should not accept words before game starts");
+
+    ws1.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_submit_word_player2_can_send() {
+    let base_url = start_server().await;
+    let (mut ws1, mut ws2) = setup_playing_game(&base_url).await;
+
+    // Player 2 submits a word
+    send_json(&mut ws2, serde_json::json!({"type": "submit_word", "word": "zoom"})).await;
+
+    // Player 2 should get word_sent
+    let msg = recv_json(&mut ws2).await;
+    assert_eq!(msg["type"], "word_sent");
+    assert_eq!(msg["word"], "zoom");
+
+    // Player 1 should get word_received
+    let msg = recv_json(&mut ws1).await;
+    assert_eq!(msg["type"], "word_received");
+    assert_eq!(msg["word"], "zoom");
+
+    // Both get queue_update
+    let msg1 = recv_json(&mut ws1).await;
+    assert_eq!(msg1["type"], "queue_update");
+    assert_eq!(msg1["your_queue"], 1); // P1 now has a word in their queue
+    assert_eq!(msg1["opponent_queue"], 0);
+
+    let msg2 = recv_json(&mut ws2).await;
+    assert_eq!(msg2["type"], "queue_update");
+    assert_eq!(msg2["your_queue"], 0);
+    assert_eq!(msg2["opponent_queue"], 1);
+
+    ws1.close(None).await.unwrap();
+    ws2.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_game_page_has_attack_ui() {
+    let base_url = start_server().await;
+    let code = create_room(&base_url).await;
+    let res = reqwest::get(format!("{base_url}/game/{code}"))
+        .await
+        .unwrap();
+    let body = res.text().await.unwrap();
+    assert!(body.contains("word-input"), "Game page should have word input");
+    assert!(body.contains("submit_word"), "Game page should send submit_word messages");
+    assert!(body.contains("opponent-queue"), "Game page should show opponent queue");
+    assert!(body.contains("attack-area"), "Game page should have attack area");
+}
+
 #[tokio::test]
 async fn test_game_page_has_ready_button() {
     let base_url = start_server().await;

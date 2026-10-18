@@ -2,7 +2,7 @@ use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, State, WebSocketUpgrade};
 use axum::response::{Html, IntoResponse, Json};
 
-use crate::game::{self, AppState, JoinResult, RoomState};
+use crate::game::{self, AppState, JoinResult, RoomState, WordSubmitResult};
 
 /// GET / — Landing page with "Create Room" button
 pub async fn index() -> Html<&'static str> {
@@ -47,6 +47,18 @@ pub async fn game_page(Path(code): Path<String>) -> Html<String> {
     justify-content: center; align-items: center; z-index: 100;
   }}
   #countdown-overlay.visible {{ display: flex; }}
+  #attack-area {{ display: none; margin-top: 20px; }}
+  #attack-area.visible {{ display: block; }}
+  #word-input {{
+    font-size: 1.5em; padding: 8px 16px; width: 300px;
+    border: 2px solid #333; border-radius: 4px; text-align: center;
+  }}
+  #word-input.error {{ border-color: #e74c3c; }}
+  #word-input.success {{ border-color: #2ecc71; }}
+  .queue-display {{ font-size: 1.2em; margin: 10px 0; }}
+  #feedback {{ min-height: 1.5em; margin-top: 10px; font-weight: bold; }}
+  #feedback.error {{ color: #e74c3c; }}
+  #feedback.success {{ color: #2ecc71; }}
 </style>
 </head>
 <body>
@@ -54,6 +66,12 @@ pub async fn game_page(Path(code): Path<String>) -> Html<String> {
 <div id="status">Connecting...</div>
 <button id="ready-btn" style="display:none;">Ready</button>
 <div id="countdown-overlay"><span id="countdown-text"></span></div>
+<div id="attack-area">
+  <div class="queue-display">Opponent: <span id="opponent-queue">0</span> words</div>
+  <div class="queue-display">Your queue: <span id="your-queue">0</span> words</div>
+  <input type="text" id="word-input" placeholder="Type a word..." autocomplete="off" />
+  <div id="feedback"></div>
+</div>
 <script>
   const code = "{code}";
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -62,6 +80,12 @@ pub async fn game_page(Path(code): Path<String>) -> Html<String> {
   const readyBtn = document.getElementById('ready-btn');
   const overlay = document.getElementById('countdown-overlay');
   const countdownText = document.getElementById('countdown-text');
+  const attackArea = document.getElementById('attack-area');
+  const wordInput = document.getElementById('word-input');
+  const feedbackEl = document.getElementById('feedback');
+  const opponentQueueEl = document.getElementById('opponent-queue');
+  const yourQueueEl = document.getElementById('your-queue');
+  let feedbackTimeout = null;
 
   ws.onopen = () => {{
     statusEl.textContent = 'Connected, waiting for game data...';
@@ -89,10 +113,50 @@ pub async fn game_page(Path(code): Path<String>) -> Html<String> {
       overlay.classList.remove('visible');
       readyBtn.style.display = 'none';
       statusEl.textContent = 'Game in progress!';
+      attackArea.classList.add('visible');
+      wordInput.focus();
     }} else if (msg.type === 'room_full') {{
       statusEl.textContent = 'Room is full!';
+    }} else if (msg.type === 'word_sent') {{
+      showFeedback('Sent: ' + msg.word, 'success');
+    }} else if (msg.type === 'word_rejected') {{
+      const reasons = {{
+        'not_in_dictionary': 'Not in dictionary',
+        'too_short': 'Too short',
+        'invalid_chars': 'Invalid characters',
+        'back_to_back_duplicate': 'Duplicate word'
+      }};
+      showFeedback(reasons[msg.reason] || msg.reason, 'error');
+    }} else if (msg.type === 'word_received') {{
+      // Will be used for defense mode in Ticket 4
+    }} else if (msg.type === 'queue_update') {{
+      yourQueueEl.textContent = msg.your_queue;
+      opponentQueueEl.textContent = msg.opponent_queue;
     }}
   }};
+
+  function showFeedback(text, type) {{
+    if (feedbackTimeout) clearTimeout(feedbackTimeout);
+    feedbackEl.textContent = text;
+    feedbackEl.className = type;
+    wordInput.className = type;
+    feedbackTimeout = setTimeout(() => {{
+      feedbackEl.textContent = '';
+      feedbackEl.className = '';
+      wordInput.className = '';
+    }}, 2000);
+  }}
+
+  wordInput.addEventListener('keydown', (e) => {{
+    if (e.key === 'Enter' || e.key === ' ') {{
+      e.preventDefault();
+      const word = wordInput.value.trim().toLowerCase();
+      if (word) {{
+        ws.send(JSON.stringify({{"type": "submit_word", "word": word}}));
+        wordInput.value = '';
+      }}
+    }}
+  }});
 
   ws.onclose = () => {{
     if (statusEl.textContent.includes('full')) return;
@@ -204,27 +268,124 @@ fn handle_client_message(state: &AppState, code: &str, player_num: u8, text: &st
         Err(_) => return,
     };
 
-    if parsed.get("type").and_then(|t| t.as_str()) == Some("ready") {
-        let mut rooms = state.rooms.lock().unwrap();
-        if let Some(room) = rooms.get_mut(code) {
-            if room.state != RoomState::WaitingForReady {
-                return;
-            }
-            let both_ready = room.set_player_ready(player_num);
-            if both_ready {
-                room.state = RoomState::Countdown;
-                // Collect senders to use outside the lock
-                let senders: Vec<_> = room.player_txs.iter().cloned().collect();
-                drop(rooms);
+    let msg_type = parsed.get("type").and_then(|t| t.as_str());
 
-                // Spawn countdown task
-                let state_clone = state.clone();
-                let code_owned = code.to_string();
-                tokio::spawn(async move {
-                    run_countdown(&senders, &state_clone, &code_owned).await;
-                });
+    match msg_type {
+        Some("ready") => {
+            let mut rooms = state.rooms.lock().unwrap();
+            if let Some(room) = rooms.get_mut(code) {
+                if room.state != RoomState::WaitingForReady {
+                    return;
+                }
+                let both_ready = room.set_player_ready(player_num);
+                if both_ready {
+                    room.state = RoomState::Countdown;
+                    // Collect senders to use outside the lock
+                    let senders: Vec<_> = room.player_txs.iter().cloned().collect();
+                    drop(rooms);
+
+                    // Spawn countdown task
+                    let state_clone = state.clone();
+                    let code_owned = code.to_string();
+                    tokio::spawn(async move {
+                        run_countdown(&senders, &state_clone, &code_owned).await;
+                    });
+                }
             }
         }
+        Some("submit_word") => {
+            let word = match parsed.get("word").and_then(|w| w.as_str()) {
+                Some(w) => w.to_string(),
+                None => return,
+            };
+
+            let mut rooms = state.rooms.lock().unwrap();
+            if let Some(room) = rooms.get_mut(code) {
+                if room.state != RoomState::Playing {
+                    return;
+                }
+
+                let result = room.submit_word(player_num, &word);
+                let player_idx = (player_num - 1) as usize;
+                let opponent_idx = if player_num == 1 { 1 } else { 0 };
+
+                match result {
+                    WordSubmitResult::Sent { ref word } => {
+                        // Send word_sent to submitter
+                        if let Some(tx) = room.player_txs.get(player_idx) {
+                            let _ = tx.send(
+                                serde_json::json!({
+                                    "type": "word_sent",
+                                    "word": word
+                                })
+                                .to_string(),
+                            );
+                        }
+
+                        // Send word_received to opponent
+                        if let Some(tx) = room.player_txs.get(opponent_idx) {
+                            let _ = tx.send(
+                                serde_json::json!({
+                                    "type": "word_received",
+                                    "word": word
+                                })
+                                .to_string(),
+                            );
+                        }
+
+                        // Send queue_update to both players (each gets their own perspective)
+                        let p1_queue = room.queue_len(1);
+                        let p2_queue = room.queue_len(2);
+
+                        // Player 1's perspective
+                        if let Some(tx) = room.player_txs.first() {
+                            let _ = tx.send(
+                                serde_json::json!({
+                                    "type": "queue_update",
+                                    "your_queue": p1_queue,
+                                    "opponent_queue": p2_queue
+                                })
+                                .to_string(),
+                            );
+                        }
+
+                        // Player 2's perspective
+                        if let Some(tx) = room.player_txs.get(1) {
+                            let _ = tx.send(
+                                serde_json::json!({
+                                    "type": "queue_update",
+                                    "your_queue": p2_queue,
+                                    "opponent_queue": p1_queue
+                                })
+                                .to_string(),
+                            );
+                        }
+                    }
+                    _ => {
+                        // Send word_rejected to submitter only
+                        let reason = match &result {
+                            WordSubmitResult::InvalidWord => "not_in_dictionary",
+                            WordSubmitResult::TooShort => "too_short",
+                            WordSubmitResult::InvalidChars => "invalid_chars",
+                            WordSubmitResult::BackToBackDuplicate => "back_to_back_duplicate",
+                            WordSubmitResult::Sent { .. } => unreachable!(),
+                        };
+
+                        if let Some(tx) = room.player_txs.get(player_idx) {
+                            let _ = tx.send(
+                                serde_json::json!({
+                                    "type": "word_rejected",
+                                    "word": word,
+                                    "reason": reason
+                                })
+                                .to_string(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -247,9 +408,10 @@ async fn run_countdown(
         let _ = tx.send(msg.clone());
     }
 
-    // Transition to Playing
+    // Transition to Playing and initialize player states
     let mut rooms = state.rooms.lock().unwrap();
     if let Some(room) = rooms.get_mut(code) {
         room.state = RoomState::Playing;
+        room.init_player_states();
     }
 }
