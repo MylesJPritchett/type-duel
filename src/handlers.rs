@@ -33,6 +33,10 @@ pub async fn create_room(State(state): State<AppState>) -> Json<serde_json::Valu
 
 /// GET /game/:code — Game page
 pub async fn game_page(Path(code): Path<String>) -> Html<String> {
+    // Validate: must be exactly 4 chars, uppercase alphanumeric
+    if code.len() != 4 || !code.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()) {
+        return Html("<h1>Invalid room code</h1>".to_string());
+    }
     Html(format!(
         r#"<!DOCTYPE html>
 <html>
@@ -469,7 +473,7 @@ async fn handle_socket(mut socket: WebSocket, code: String, state: AppState) {
             // Player disconnected — check if we should trigger game_over
             let is_playing = {
                 let rooms = state.rooms.lock().unwrap();
-                rooms.get(&code).map_or(false, |r| r.is_playing())
+                rooms.get(&code).is_some_and(|r| r.is_playing())
             };
 
             if is_playing {
@@ -488,7 +492,7 @@ async fn handle_socket(mut socket: WebSocket, code: String, state: AppState) {
 
                     let still_playing = {
                         let rooms = state_clone.rooms.lock().unwrap();
-                        rooms.get(&code_clone).map_or(false, |r| r.is_playing())
+                        rooms.get(&code_clone).is_some_and(|r| r.is_playing())
                     };
 
                     if still_playing {
@@ -520,6 +524,33 @@ async fn handle_socket(mut socket: WebSocket, code: String, state: AppState) {
     }
 }
 
+fn send_queue_updates(room: &game::Room) {
+    let p1_queue = room.queue_len(1);
+    let p2_queue = room.queue_len(2);
+
+    if let Some(tx) = room.player_txs.first() {
+        let _ = tx.send(
+            serde_json::json!({
+                "type": "queue_update",
+                "your_queue": p1_queue,
+                "opponent_queue": p2_queue
+            })
+            .to_string(),
+        );
+    }
+
+    if let Some(tx) = room.player_txs.get(1) {
+        let _ = tx.send(
+            serde_json::json!({
+                "type": "queue_update",
+                "your_queue": p2_queue,
+                "opponent_queue": p1_queue
+            })
+            .to_string(),
+        );
+    }
+}
+
 fn handle_client_message(state: &AppState, code: &str, player_num: u8, text: &str) {
     let parsed: serde_json::Value = match serde_json::from_str(text) {
         Ok(v) => v,
@@ -539,7 +570,7 @@ fn handle_client_message(state: &AppState, code: &str, player_num: u8, text: &st
                 if both_ready {
                     room.state = RoomState::Countdown;
                     // Collect senders to use outside the lock
-                    let senders: Vec<_> = room.player_txs.iter().cloned().collect();
+                    let senders = room.player_txs.to_vec();
                     drop(rooms);
 
                     // Spawn countdown task
@@ -591,33 +622,8 @@ fn handle_client_message(state: &AppState, code: &str, player_num: u8, text: &st
                             );
                         }
 
-                        // Send queue_update to both players (each gets their own perspective)
-                        let p1_queue = room.queue_len(1);
-                        let p2_queue = room.queue_len(2);
-
-                        // Player 1's perspective
-                        if let Some(tx) = room.player_txs.first() {
-                            let _ = tx.send(
-                                serde_json::json!({
-                                    "type": "queue_update",
-                                    "your_queue": p1_queue,
-                                    "opponent_queue": p2_queue
-                                })
-                                .to_string(),
-                            );
-                        }
-
-                        // Player 2's perspective
-                        if let Some(tx) = room.player_txs.get(1) {
-                            let _ = tx.send(
-                                serde_json::json!({
-                                    "type": "queue_update",
-                                    "your_queue": p2_queue,
-                                    "opponent_queue": p1_queue
-                                })
-                                .to_string(),
-                            );
-                        }
+                        // Send queue_update to both players
+                        send_queue_updates(room);
 
                         // Check for queue overflow
                         if let Some(winner) = room.check_overflow(player_num) {
@@ -664,33 +670,7 @@ fn handle_client_message(state: &AppState, code: &str, player_num: u8, text: &st
 
                 let success = room.complete_word(player_num, &word);
                 if success {
-                    // Send queue_update to both players
-                    let p1_queue = room.queue_len(1);
-                    let p2_queue = room.queue_len(2);
-
-                    // Player 1's perspective
-                    if let Some(tx) = room.player_txs.first() {
-                        let _ = tx.send(
-                            serde_json::json!({
-                                "type": "queue_update",
-                                "your_queue": p1_queue,
-                                "opponent_queue": p2_queue
-                            })
-                            .to_string(),
-                        );
-                    }
-
-                    // Player 2's perspective
-                    if let Some(tx) = room.player_txs.get(1) {
-                        let _ = tx.send(
-                            serde_json::json!({
-                                "type": "queue_update",
-                                "your_queue": p2_queue,
-                                "opponent_queue": p1_queue
-                            })
-                            .to_string(),
-                        );
-                    }
+                    send_queue_updates(room);
                 }
             }
         }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -21,10 +21,10 @@ pub enum RoomState {
 }
 
 /// Per-player game state during a match
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PlayerState {
     /// Words from opponent that this player must type (defense queue)
-    pub defense_queue: Vec<String>,
+    pub defense_queue: VecDeque<String>,
     /// Last word sent, for back-to-back duplicate prevention
     pub last_sent_word: Option<String>,
     /// Counter of words successfully sent to opponent
@@ -39,14 +39,7 @@ pub struct PlayerState {
 
 impl PlayerState {
     pub fn new() -> Self {
-        PlayerState {
-            defense_queue: Vec::new(),
-            last_sent_word: None,
-            words_sent: 0,
-            words_completed: 0,
-            longest_word_sent: None,
-            total_chars_typed: 0,
-        }
+        PlayerState::default()
     }
 }
 
@@ -159,7 +152,10 @@ impl Room {
             _ => return WordSubmitResult::InvalidWord,
         };
 
-        let submitter = submitter_state.expect("player state not initialized");
+        let submitter = match submitter_state {
+            Some(s) => s,
+            None => return WordSubmitResult::InvalidWord,
+        };
 
         // Check for back-to-back duplicate
         if submitter.last_sent_word.as_deref() == Some(word) {
@@ -175,7 +171,7 @@ impl Room {
         let is_longer = submitter
             .longest_word_sent
             .as_ref()
-            .map_or(true, |prev| word.len() > prev.len());
+            .is_none_or(|prev| word.len() > prev.len());
         if is_longer {
             submitter.longest_word_sent = Some(word.to_string());
         }
@@ -187,8 +183,11 @@ impl Room {
             _ => unreachable!(),
         };
 
-        let opponent = opponent_state.expect("opponent state not initialized");
-        opponent.defense_queue.push(word.to_string());
+        let opponent = match opponent_state {
+            Some(s) => s,
+            None => return WordSubmitResult::InvalidWord,
+        };
+        opponent.defense_queue.push_back(word.to_string());
 
         WordSubmitResult::Sent {
             word: word.to_string(),
@@ -234,7 +233,7 @@ impl Room {
             return false;
         }
 
-        let completed_word = state.defense_queue.remove(0);
+        let completed_word = state.defense_queue.pop_front().unwrap();
         state.words_completed += 1;
         state.total_chars_typed += completed_word.len() as u32;
         true
@@ -329,7 +328,7 @@ impl Room {
 }
 
 /// Shared application state
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AppState {
     pub rooms: Arc<Mutex<HashMap<String, Room>>>,
 }
