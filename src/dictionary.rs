@@ -4,11 +4,12 @@ use std::sync::LazyLock;
 /// The raw EFF large wordlist file, embedded at compile time.
 const WORDLIST_RAW: &str = include_str!("../data/wordlist.txt");
 
-/// Lazily parsed set of valid words from the EFF wordlist.
+/// Lazily parsed set of valid words from the wordlist.
 static WORDS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     WORDLIST_RAW
         .lines()
-        .filter_map(|line| line.split('\t').nth(1))
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
         .collect()
 });
 
@@ -40,8 +41,8 @@ mod tests {
 
     #[test]
     fn test_wordlist_loads() {
-        // The EFF wordlist has 7776 words
-        assert_eq!(WORDS.len(), 7776);
+        // The wordlist should have a substantial number of words
+        assert!(WORDS.len() > 100_000, "Dictionary should have >100k words, got {}", WORDS.len());
     }
 
     #[test]
@@ -49,6 +50,27 @@ mod tests {
         assert!(is_valid_word("abacus"));
         assert!(is_valid_word("zoom"));
         assert!(is_valid_word("abide"));
+    }
+
+    #[test]
+    fn test_common_english_words_are_valid() {
+        // These are extremely common English words that any typing game dictionary must include
+        let common_words = [
+            "where", "this", "that", "have", "with", "from", "they", "been",
+            "some", "what", "when", "your", "which", "their", "will", "each",
+            "make", "like", "just", "over", "such", "take", "than", "them",
+            "very", "after", "also", "made", "well", "back", "much", "then",
+            "could", "people", "into", "year", "most", "good", "know", "come",
+            "think", "about", "would", "still", "going", "never", "under",
+            "same", "last", "long", "great", "little", "world", "house",
+            "between", "before", "should", "through", "right", "small",
+            "place", "around", "every", "being", "work", "three", "water",
+            "balls", "hello", "keyboard", "typing", "game", "play", "fast",
+            "slow", "quick", "jump", "runs", "walk", "read", "write",
+        ];
+        for word in &common_words {
+            assert!(is_valid_word(word), "Common word '{word}' should be in dictionary");
+        }
     }
 
     #[test]
