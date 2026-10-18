@@ -4,13 +4,25 @@ use std::sync::{Arc, Mutex};
 use rand::Rng;
 use tokio::sync::mpsc;
 
+/// Room lifecycle states
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoomState {
+    WaitingForPlayers,
+    WaitingForReady,
+    Countdown,
+    Playing,
+}
+
 /// Represents a game room
 #[derive(Debug)]
 pub struct Room {
     pub code: String,
     pub player_count: u8,
-    /// Channel to notify player 1 when player 2 joins
-    pub notify_tx: Option<mpsc::UnboundedSender<String>>,
+    pub state: RoomState,
+    pub player1_ready: bool,
+    pub player2_ready: bool,
+    /// Per-player sender channels for broadcasting messages
+    pub player_txs: Vec<mpsc::UnboundedSender<String>>,
 }
 
 impl Room {
@@ -18,8 +30,40 @@ impl Room {
         Room {
             code,
             player_count: 0,
-            notify_tx: None,
+            state: RoomState::WaitingForPlayers,
+            player1_ready: false,
+            player2_ready: false,
+            player_txs: Vec::new(),
         }
+    }
+
+    /// Register a player's sender channel. Returns the index (0 for player 1, 1 for player 2).
+    pub fn add_player_tx(&mut self, tx: mpsc::UnboundedSender<String>) -> usize {
+        let idx = self.player_txs.len();
+        self.player_txs.push(tx);
+        idx
+    }
+
+    /// Broadcast a message to all connected players
+    pub fn broadcast(&self, msg: &str) {
+        for tx in &self.player_txs {
+            let _ = tx.send(msg.to_string());
+        }
+    }
+
+    /// Mark a player as ready (player_num is 1 or 2). Returns true if both are now ready.
+    pub fn set_player_ready(&mut self, player_num: u8) -> bool {
+        match player_num {
+            1 => self.player1_ready = true,
+            2 => self.player2_ready = true,
+            _ => {}
+        }
+        self.both_ready()
+    }
+
+    /// Check if both players are ready
+    pub fn both_ready(&self) -> bool {
+        self.player1_ready && self.player2_ready
     }
 }
 
@@ -181,5 +225,74 @@ mod tests {
         // After leaving, should be able to join again
         let result = join_room(&state, &code);
         assert_eq!(result, JoinResult::Joined(2));
+    }
+
+    #[test]
+    fn test_room_initial_state() {
+        let room = Room::new("TEST".to_string());
+        assert_eq!(room.state, RoomState::WaitingForPlayers);
+        assert!(!room.player1_ready);
+        assert!(!room.player2_ready);
+    }
+
+    #[test]
+    fn test_set_player1_ready() {
+        let mut room = Room::new("TEST".to_string());
+        let both = room.set_player_ready(1);
+        assert!(room.player1_ready);
+        assert!(!room.player2_ready);
+        assert!(!both);
+    }
+
+    #[test]
+    fn test_set_player2_ready() {
+        let mut room = Room::new("TEST".to_string());
+        let both = room.set_player_ready(2);
+        assert!(!room.player1_ready);
+        assert!(room.player2_ready);
+        assert!(!both);
+    }
+
+    #[test]
+    fn test_both_players_ready() {
+        let mut room = Room::new("TEST".to_string());
+        room.set_player_ready(1);
+        let both = room.set_player_ready(2);
+        assert!(both);
+        assert!(room.both_ready());
+    }
+
+    #[test]
+    fn test_broadcast_sends_to_all_players() {
+        let mut room = Room::new("TEST".to_string());
+        let (tx1, mut rx1) = tokio::sync::mpsc::unbounded_channel();
+        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        room.add_player_tx(tx1);
+        room.add_player_tx(tx2);
+
+        room.broadcast(r#"{"type":"test"}"#);
+
+        assert_eq!(rx1.try_recv().unwrap(), r#"{"type":"test"}"#);
+        assert_eq!(rx2.try_recv().unwrap(), r#"{"type":"test"}"#);
+    }
+
+    #[test]
+    fn test_room_state_transitions() {
+        let mut room = Room::new("TEST".to_string());
+        assert_eq!(room.state, RoomState::WaitingForPlayers);
+
+        // Simulate both players joining
+        room.state = RoomState::WaitingForReady;
+        assert_eq!(room.state, RoomState::WaitingForReady);
+
+        // Both ready -> countdown
+        room.set_player_ready(1);
+        room.set_player_ready(2);
+        room.state = RoomState::Countdown;
+        assert_eq!(room.state, RoomState::Countdown);
+
+        // Countdown done -> playing
+        room.state = RoomState::Playing;
+        assert_eq!(room.state, RoomState::Playing);
     }
 }
